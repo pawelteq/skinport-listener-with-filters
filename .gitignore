@@ -1,0 +1,23 @@
+# Zależności
+node_modules/
+
+# Zmienne środowiskowe (klucze API!)
+.env
+.env.local
+
+# Logi
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.log
+
+# System / edytory
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Pliki tymczasowe
+snippet.txt
