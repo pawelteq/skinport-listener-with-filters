@@ -32,6 +32,108 @@ const PRICE_REQUEST_TIMEOUT_MS = 5000;
 const STEAM_APP_ID = '730';
 const DEFAULT_PRICE_CURRENCY = 'EUR';
 const STEAM_PRICEOVERVIEW_ENDPOINT = 'https://steamcommunity.com/market/priceoverview/';
+const CSFLOAT_LISTINGS_ENDPOINT = 'https://csfloat.com/api/v1/listings';
+const CSFLOAT_API_KEY = process.env.CSFLOAT_API_KEY || '';
+const SKINPORT_ITEMS_ENDPOINT = 'https://api.skinport.com/v1/items';
+const SKINPORT_CATALOG_TTL_MS = 5 * 60 * 1000; // odswiezaj katalog co 5 minut (limit API)
+const SKINPORT_CATALOG_TIMEOUT_MS = 15000;
+
+// Cache katalogu Skinport: { currency -> { fetchedAt, map } }
+const skinportCatalogCache = new Map();
+const skinportCatalogInFlight = new Map();
+
+// --- Kursy walut (baza EUR) ---
+const FX_ENDPOINT = 'https://api.frankfurter.app/latest?from=EUR';
+const FX_TTL_MS = 60 * 60 * 1000; // 1 godzina
+// Awaryjne kursy, gdyby API bylo niedostepne (przyblizone)
+let currentFx = { base: 'EUR', rates: { EUR: 1, USD: 1.08, PLN: 4.3, GBP: 0.85 }, fetchedAt: 0 };
+
+async function refreshFxRates() {
+  try {
+    const response = await fetchWithTimeout(
+      FX_ENDPOINT,
+      { headers: { Accept: 'application/json' } },
+      PRICE_REQUEST_TIMEOUT_MS,
+      'FX timeout'
+    );
+    if (!response.ok) throw new Error(`FX HTTP ${response.status}`);
+    const data = await response.json();
+    const rates = { EUR: 1, ...(data && data.rates ? data.rates : {}) };
+    currentFx = { base: 'EUR', rates, fetchedAt: Date.now() };
+    console.log('Kursy walut zaktualizowane', new Date().toISOString());
+  } catch (err) {
+    console.error('Nie udalo sie pobrac kursow walut:', err && err.message ? err.message : err);
+  }
+  return currentFx;
+}
+
+async function getSkinportCatalog(desiredCurrency) {
+  const currency = normalizeCurrency(desiredCurrency) || DEFAULT_PRICE_CURRENCY;
+  const cached = skinportCatalogCache.get(currency);
+  if (cached && Date.now() - cached.fetchedAt < SKINPORT_CATALOG_TTL_MS) {
+    return cached.map;
+  }
+
+  // Unikaj rownoleglych pobran tego samego katalogu
+  if (skinportCatalogInFlight.has(currency)) {
+    return skinportCatalogInFlight.get(currency);
+  }
+
+  const promise = (async () => {
+    const params = new URLSearchParams({ app_id: STEAM_APP_ID, currency, tradable: '0' });
+    const response = await fetchWithTimeout(
+      `${SKINPORT_ITEMS_ENDPOINT}?${params.toString()}`,
+      { headers: { Accept: 'application/json', 'Accept-Encoding': 'br' } },
+      SKINPORT_CATALOG_TIMEOUT_MS,
+      'Skinport items timeout'
+    );
+    if (!response.ok) {
+      throw new Error(`Skinport items HTTP ${response.status}`);
+    }
+    const data = await response.json();
+    const list = Array.isArray(data) ? data : [];
+    const map = new Map();
+    for (const entry of list) {
+      const name = entry && entry.market_hash_name;
+      if (!name) continue;
+      map.set(name.toLowerCase(), {
+        minPrice: findFirstNumeric(entry.min_price),
+        suggestedPrice: findFirstNumeric(entry.suggested_price),
+        quantity: findFirstNumeric(entry.quantity),
+        currency,
+        itemPage: entry.item_page || entry.market_page || null
+      });
+    }
+    skinportCatalogCache.set(currency, { fetchedAt: Date.now(), map });
+    return map;
+  })().finally(() => skinportCatalogInFlight.delete(currency));
+
+  skinportCatalogInFlight.set(currency, promise);
+  return promise;
+}
+
+async function fetchSkinportLowest(marketHashName, desiredCurrency) {
+  if (!marketHashName) throw new Error('Brak nazwy przedmiotu');
+  const currency = normalizeCurrency(desiredCurrency) || DEFAULT_PRICE_CURRENCY;
+  const map = await getSkinportCatalog(currency);
+  const entry = map.get(String(marketHashName).toLowerCase());
+  const fallbackUrl = `https://skinport.com/market/${STEAM_APP_ID}?search=${encodeURIComponent(marketHashName)}`;
+  if (!entry || entry.minPrice == null) {
+    return {
+      lowestPrice: entry ? entry.minPrice : null,
+      currency,
+      sourceUrl: (entry && entry.itemPage) || fallbackUrl,
+      error: entry ? undefined : 'Brak w katalogu Skinport'
+    };
+  }
+  return {
+    lowestPrice: entry.minPrice,
+    suggestedPrice: entry.suggestedPrice,
+    quantity: entry.quantity,
+    currency,
+    sourceUrl: entry.itemPage || fallbackUrl
+  };
+}
 
 const STEAM_CURRENCY_PARAM_MAP = {
   USD: '1',
@@ -318,6 +420,57 @@ async function fetchSteamPriceLive(marketHashName, desiredCurrency) {
   };
 }
 
+async function fetchCSFloatPriceLive(marketHashName) {
+  if (!marketHashName) {
+    throw new Error('Brak nazwy przedmiotu');
+  }
+
+  const params = new URLSearchParams({
+    sort_by: 'lowest_price',
+    limit: '1',
+    market_hash_name: marketHashName
+  });
+
+  const headers = { Accept: 'application/json' };
+  if (CSFLOAT_API_KEY) {
+    headers.Authorization = CSFLOAT_API_KEY;
+  }
+
+  const response = await fetchWithTimeout(
+    `${CSFLOAT_LISTINGS_ENDPOINT}?${params.toString()}`,
+    { headers },
+    PRICE_REQUEST_TIMEOUT_MS,
+    'CSFloat listings timeout'
+  );
+
+  if (!response.ok) {
+    throw new Error(`CSFloat listings HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  // Response shape: { data: [ { price: <USD cents>, ... } ] } or a bare array
+  const listings = Array.isArray(data) ? data : Array.isArray(data && data.data) ? data.data : [];
+  const first = listings[0];
+  if (!first) {
+    throw new Error('Brak ofert na CSFloat');
+  }
+
+  // CSFloat prices are integer cents in USD
+  const rawPrice = first.price ?? (first.reference && first.reference.base_price);
+  const numericValue = findFirstNumeric(rawPrice);
+  if (numericValue == null) {
+    throw new Error('CSFloat brak ceny');
+  }
+  const lowest = Math.round(numericValue) / 100;
+
+  return {
+    lowestPrice: lowest,
+    currency: 'USD',
+    sourceUrl: `https://csfloat.com/search?market_hash_name=${encodeURIComponent(marketHashName)}&sort_by=lowest_price`,
+    raw: first
+  };
+}
+
 // Individual item price fetching is handled by fetchSteamPriceLive
 
 async function getPriceComparisons(marketName, saleCurrency) {
@@ -328,12 +481,23 @@ async function getPriceComparisons(marketName, saleCurrency) {
     return result;
   }
 
-  try {
-    const liveEntry = await fetchSteamPriceLive(marketName, normalizedSaleCurrency);
-    result.steam = liveEntry;
-  } catch (err) {
-    result.steam = { error: err && err.message ? err.message : 'Brak danych ze Steam' };
-  }
+  const [steamResult, csfloatResult, skinportResult] = await Promise.allSettled([
+    fetchSteamPriceLive(marketName, normalizedSaleCurrency),
+    fetchCSFloatPriceLive(marketName),
+    fetchSkinportLowest(marketName, normalizedSaleCurrency)
+  ]);
+
+  result.steam = steamResult.status === 'fulfilled'
+    ? steamResult.value
+    : { error: steamResult.reason && steamResult.reason.message ? steamResult.reason.message : 'Brak danych ze Steam' };
+
+  result.csfloat = csfloatResult.status === 'fulfilled'
+    ? csfloatResult.value
+    : { error: csfloatResult.reason && csfloatResult.reason.message ? csfloatResult.reason.message : 'Brak danych z CSFloat' };
+
+  result.skinport = skinportResult.status === 'fulfilled'
+    ? skinportResult.value
+    : { error: skinportResult.reason && skinportResult.reason.message ? skinportResult.reason.message : 'Brak danych ze Skinport' };
 
   return result;
 }
@@ -395,24 +559,32 @@ async function enrichSale(sale, defaultCurrency) {
   }
 
   if (priceParsed.value != null && comparisons && typeof comparisons === 'object') {
-    const steamEntry = comparisons.steam;
-    if (steamEntry && !steamEntry.error) {
-      const entryCurrency = normalizeCurrency(steamEntry.currency) || saleCurrency || priceParsed.currency;
-      steamEntry.currency = entryCurrency;
+    // Policz roznice ceny dla kazdego zrodla (gdy waluta zgadza sie z oferta)
+    for (const key of ['steam', 'csfloat', 'skinport']) {
+      const entry = comparisons[key];
+      if (!entry || entry.error) continue;
+      const entryCurrency = normalizeCurrency(entry.currency) || saleCurrency || priceParsed.currency;
+      entry.currency = entryCurrency;
       if (
-        steamEntry.lowestPrice != null &&
+        entry.lowestPrice != null &&
         saleCurrency &&
         entryCurrency &&
         entryCurrency === saleCurrency
       ) {
-        const diff = steamEntry.lowestPrice - priceParsed.value;
-        const diffRounded = Math.round(diff * 100) / 100;
-        steamEntry.diff = diffRounded;
-        steamEntry.diffPercent = priceParsed.value > 0
-          ? Math.round(((steamEntry.lowestPrice / priceParsed.value - 1) * 100) * 100) / 100
+        const diff = entry.lowestPrice - priceParsed.value;
+        entry.diff = Math.round(diff * 100) / 100;
+        entry.diffPercent = priceParsed.value > 0
+          ? Math.round(((entry.lowestPrice / priceParsed.value - 1) * 100) * 100) / 100
           : null;
       }
     }
+  }
+
+  // Bezposredni link do przedmiotu na Skinport (z katalogu)
+  if (comparisons && comparisons.skinport && comparisons.skinport.sourceUrl) {
+    cloned.itemUrl = comparisons.skinport.sourceUrl;
+  } else if (marketName) {
+    cloned.itemUrl = `https://skinport.com/market/${STEAM_APP_ID}?search=${encodeURIComponent(marketName)}`;
   }
 
   cloned.priceInsights = {
@@ -422,6 +594,7 @@ async function enrichSale(sale, defaultCurrency) {
       currency: saleCurrency || priceParsed.currency || null
     },
     saleCurrency: saleCurrency || priceParsed.currency || null,
+    itemUrl: cloned.itemUrl || null,
     comparisons,
     lastUpdated: new Date().toISOString()
   };
@@ -493,8 +666,16 @@ socket.emit('saleFeedJoin', { currency: 'EUR', locale: 'en', appid: 730 });
 // Browser socket.io connections
 io.on('connection', (socket) => {
   console.log('browser connected', socket.id);
+  // Wyslij aktualne kursy walut nowo polaczonej przegladarce
+  socket.emit('fxRates', currentFx);
   socket.on('disconnect', () => console.log('browser disconnected', socket.id));
 });
+
+// Pobierz kursy na starcie i odswiezaj co godzine, rozsylajac do przegladarek
+refreshFxRates().then(() => io.emit('fxRates', currentFx));
+setInterval(() => {
+  refreshFxRates().then(() => io.emit('fxRates', currentFx));
+}, FX_TTL_MS);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Server listening on http://localhost:${PORT}`));

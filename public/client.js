@@ -6,14 +6,45 @@ const minDiscountInput = document.getElementById('minDiscount');
 const itemsCountEl = document.getElementById('itemsCount');
 const lastUpdatedEl = document.getElementById('lastUpdated');
 
+const currencyInput = document.getElementById('currency');
+
 let minDiscount = Number(minDiscountInput.value) || 0;
 let items = [];
 let latestUpdateTs = null;
+let targetCurrency = (currencyInput && currencyInput.value) || 'PLN';
+// Kursy walut (baza EUR); aktualizowane z serwera. Wartosci awaryjne na start.
+let fxRates = { EUR: 1, USD: 1.08, PLN: 4.3, GBP: 0.85 };
 
 minDiscountInput.addEventListener('input', () => {
   minDiscount = Number(minDiscountInput.value) || 0;
   render();
 });
+
+if (currencyInput) {
+  currencyInput.addEventListener('change', () => {
+    targetCurrency = currencyInput.value || 'PLN';
+    render();
+  });
+}
+
+socket.on('fxRates', (fx) => {
+  if (fx && fx.rates && typeof fx.rates === 'object') {
+    fxRates = { ...fxRates, ...fx.rates };
+    render();
+  }
+});
+
+// Przelicz kwote z waluty zrodlowej na aktualnie wybrana walute (baza EUR)
+function convertToTarget(value, fromCurrency) {
+  if (value == null || Number.isNaN(value)) return null;
+  const from = normalizeCurrencyCode(fromCurrency) || 'EUR';
+  const to = targetCurrency;
+  if (from === to) return value;
+  const rFrom = fxRates[from];
+  const rTo = fxRates[to];
+  if (!rFrom || !rTo) return value; // brak kursu -> pokaz oryginal
+  return (value / rFrom) * rTo;
+}
 
 function setStatus(text, state) {
   statusEl.textContent = text;
@@ -197,74 +228,61 @@ function getSalePriceInfo(sale) {
   };
 }
 
-function buildComparisonElement(sourceKey, entry, saleCurrency) {
-  if (!entry) return null;
-  const container = document.createElement('div');
-  container.className = 'comparison neutral';
+// Buduje jedna rowna sekcje cenowa (Skinport / Steam / CSFloat)
+function makePriceSection({ label, mainText, mainIsError, state, secondaryLabel, secondaryText, sourceUrl, diffBase, diffValue }) {
+  const el = document.createElement('div');
+  el.className = 'price-section ' + (state === 'cheapest' ? 'cheapest' : state === 'other' ? 'other' : 'neutral');
 
-  const labelMap = {
-    steam: 'Steam',
-    csfloat: 'CSFloat'
-  };
+  const head = document.createElement('div');
+  head.className = 'ps-head';
+  const lbl = document.createElement('span');
+  lbl.className = 'ps-label';
+  lbl.textContent = label;
+  head.appendChild(lbl);
+  if (sourceUrl) {
+    const link = document.createElement('a');
+    link.className = 'meta-link';
+    link.href = sourceUrl;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = 'Zrodlo';
+    head.appendChild(link);
+  }
+  el.appendChild(head);
 
-  const left = document.createElement('div');
-  const sourceEl = document.createElement('div');
-  sourceEl.className = 'source';
-  sourceEl.textContent = labelMap[sourceKey] || sourceKey.toUpperCase();
-  left.appendChild(sourceEl);
+  const body = document.createElement('div');
+  body.className = 'ps-body';
+  const main = document.createElement('span');
+  main.className = 'ps-main' + (mainIsError ? ' ps-error' : '');
+  main.textContent = mainText || '--';
+  body.appendChild(main);
 
-  if (entry.error) {
-    const errorEl = document.createElement('div');
-    errorEl.className = 'notes';
-    errorEl.textContent = entry.error;
-    left.appendChild(errorEl);
-    container.appendChild(left);
-    return container;
+  if (
+    diffBase != null && diffValue != null &&
+    !Number.isNaN(diffBase) && !Number.isNaN(diffValue)
+  ) {
+    const diff = Math.round((diffValue - diffBase) * 100) / 100;
+    const pct = diffBase > 0 ? Math.round((diffValue / diffBase - 1) * 100 * 100) / 100 : null;
+    const sign = diff < 0 ? '-' : diff > 0 ? '+' : '';
+    const amount = formatMoney(Math.abs(diff), targetCurrency, Math.abs(diff));
+    const pctText = pct != null && !Number.isNaN(pct)
+      ? ` (${pct < 0 ? '-' : pct > 0 ? '+' : ''}${Math.abs(pct).toFixed(2)}%)`
+      : '';
+    const diffEl = document.createElement('span');
+    diffEl.className = 'ps-diff';
+    diffEl.textContent = `${sign}${amount}${pctText}`;
+    body.appendChild(diffEl);
+  }
+  el.appendChild(body);
+
+  if (secondaryText) {
+    const note = document.createElement('div');
+    note.className = 'ps-note';
+    note.textContent = secondaryLabel ? `${secondaryLabel}: ${secondaryText}` : secondaryText;
+    el.appendChild(note);
   }
 
-  const currency = normalizeCurrencyCode(entry.currency) || saleCurrency;
-  const valueEl = document.createElement('div');
-  valueEl.className = 'value';
-  valueEl.textContent = entry.lowestPrice != null
-    ? formatMoney(entry.lowestPrice, currency, entry.lowestPrice)
-    : '--';
-  left.appendChild(valueEl);
-
-  if (sourceKey === 'steam' && entry.medianPrice != null && !Number.isNaN(entry.medianPrice)) {
-    const medianEl = document.createElement('div');
-    medianEl.className = 'notes';
-    medianEl.textContent = `Mediana: ${formatMoney(entry.medianPrice, currency, entry.medianPrice)}`;
-    left.appendChild(medianEl);
-  }
-
-  container.appendChild(left);
-
-  const diffEl = document.createElement('div');
-  diffEl.className = 'diff';
-  if (entry.diff != null && !Number.isNaN(entry.diff)) {
-    container.classList.remove('neutral');
-    if (entry.diff < 0) {
-      container.classList.add('positive');
-    } else if (entry.diff > 0) {
-      container.classList.add('negative');
-    } else {
-      container.classList.add('neutral');
-    }
-    diffEl.textContent = formatDiffText(entry.diff, entry.diffPercent, currency || saleCurrency);
-  }
-  container.appendChild(diffEl);
-
-  if (entry.sourceUrl) {
-    const linkEl = document.createElement('a');
-    linkEl.className = 'meta-link';
-    linkEl.href = entry.sourceUrl;
-    linkEl.target = '_blank';
-    linkEl.rel = 'noopener noreferrer';
-    linkEl.textContent = 'Zrodlo';
-    container.appendChild(linkEl);
-  }
-
-  return container;
+  return el;
 }
 
 function updateStats(filteredItems) {
@@ -301,7 +319,8 @@ function render() {
     const name = sale?.marketName || sale?.name || sale?.title || '-';
     const salePriceInfo = getSalePriceInfo(sale);
     const saleCurrency = salePriceInfo.currency || normalizeCurrencyCode(sale?.priceInsights?.saleCurrency) || 'EUR';
-    const salePriceText = formatMoney(salePriceInfo.value, saleCurrency, salePriceInfo.raw ?? '-');
+    const salePriceTarget = convertToTarget(salePriceInfo.value, saleCurrency);
+    const salePriceText = formatMoney(salePriceTarget, targetCurrency, salePriceInfo.raw ?? '-');
     const prevRaw = sale?.previousPrice || sale?.oldPrice || sale?.normalPrice || sale?.suggestedPrice;
     const prevParsed = parsePriceText(prevRaw);
 
@@ -353,35 +372,75 @@ function render() {
     header.appendChild(headerLeft);
     card.appendChild(header);
 
-    const priceRow = document.createElement('div');
-    priceRow.className = 'price-row';
-
-    const priceChip = document.createElement('span');
-    priceChip.className = 'price-chip';
-    priceChip.textContent = `Skinport: ${salePriceText}`;
-    priceRow.appendChild(priceChip);
-    card.appendChild(priceRow);
-
+    // --- Trzy rowne sekcje cenowe: Skinport, Steam, CSFloat ---
     const comparisons = sale?.priceInsights?.comparisons || {};
-    const comparisonGrid = document.createElement('div');
-    comparisonGrid.className = 'comparison-grid';
+    const itemUrl = sale?.itemUrl || sale?.priceInsights?.itemUrl || sale?.url;
 
-    const comparisonKeys = Object.keys(comparisons);
-    if (comparisonKeys.length === 0) {
-      const waitingEl = document.createElement('div');
-      waitingEl.className = 'notes';
-      waitingEl.textContent = 'Brak danych cenowych dla tego przedmiotu.';
-      comparisonGrid.appendChild(waitingEl);
-    } else {
-      for (const sourceKey of comparisonKeys) {
-        const element = buildComparisonElement(sourceKey, comparisons[sourceKey], saleCurrency);
-        if (element) {
-          comparisonGrid.appendChild(element);
-        }
-      }
+    const prices = document.createElement('div');
+    prices.className = 'prices';
+
+    // Wyznacz najtansze zrodlo (zielony), reszta czerwona
+    const stEntry = comparisons.steam;
+    const cfEntry = comparisons.csfloat;
+    const stLowVal = stEntry && !stEntry.error ? convertToTarget(stEntry.lowestPrice, stEntry.currency) : null;
+    const cfLowVal = cfEntry && !cfEntry.error ? convertToTarget(cfEntry.lowestPrice, cfEntry.currency) : null;
+    const candidates = [
+      { key: 'skinport', value: salePriceTarget },
+      { key: 'steam', value: stLowVal },
+      { key: 'csfloat', value: cfLowVal }
+    ].filter((c) => c.value != null && !Number.isNaN(c.value));
+    const minVal = candidates.length ? Math.min(...candidates.map((c) => c.value)) : null;
+    const stateFor = (value) => {
+      if (value == null || Number.isNaN(value) || minVal == null) return 'none';
+      return value <= minVal + 1e-9 ? 'cheapest' : 'other';
+    };
+
+    // Skinport: cena tej oferty + najnizsza na rynku
+    const sp = comparisons.skinport;
+    const spMinTarget = sp && !sp.error ? convertToTarget(sp.lowestPrice, sp.currency) : null;
+    let spNote = null;
+    if (spMinTarget != null) {
+      spNote = `${formatMoney(spMinTarget, targetCurrency, spMinTarget)}${sp.quantity != null ? ` (${sp.quantity} ofert)` : ''}`;
+    } else if (sp && sp.error) {
+      spNote = sp.error;
     }
+    prices.appendChild(makePriceSection({
+      label: 'Skinport',
+      mainText: salePriceText,
+      state: stateFor(salePriceTarget),
+      secondaryLabel: 'Min',
+      secondaryText: spNote,
+      sourceUrl: itemUrl || (sp && sp.sourceUrl) || null,
+      diffBase: salePriceTarget,
+      diffValue: spMinTarget
+    }));
 
-    card.appendChild(comparisonGrid);
+    // Steam: najnizsza + mediana
+    const stMed = stEntry && !stEntry.error ? convertToTarget(stEntry.medianPrice, stEntry.currency) : null;
+    prices.appendChild(makePriceSection({
+      label: 'Steam',
+      mainText: stLowVal != null ? formatMoney(stLowVal, targetCurrency, stLowVal) : (stEntry && stEntry.error ? stEntry.error : '--'),
+      mainIsError: !!(stEntry && stEntry.error),
+      state: stateFor(stLowVal),
+      secondaryLabel: 'Mediana',
+      secondaryText: stMed != null ? formatMoney(stMed, targetCurrency, stMed) : null,
+      sourceUrl: stEntry && stEntry.sourceUrl,
+      diffBase: salePriceTarget,
+      diffValue: stLowVal
+    }));
+
+    // CSFloat: najnizsza
+    prices.appendChild(makePriceSection({
+      label: 'CSFloat',
+      mainText: cfLowVal != null ? formatMoney(cfLowVal, targetCurrency, cfLowVal) : (cfEntry && cfEntry.error ? cfEntry.error : '--'),
+      mainIsError: !!(cfEntry && cfEntry.error),
+      state: stateFor(cfLowVal),
+      sourceUrl: cfEntry && cfEntry.sourceUrl,
+      diffBase: salePriceTarget,
+      diffValue: cfLowVal
+    }));
+
+    card.appendChild(prices);
     itemsEl.appendChild(card);
   }
 }
