@@ -102,16 +102,6 @@ Skinport WebSocket  ──►  serwer Node.js (main.js)  ──►  przeglądark
 - **Przeliczanie walut**: kursy z [frankfurter.app](https://www.frankfurter.app) (dane EBC,
   baza EUR). CSFloat podaje ceny w USD i są przeliczane na wybraną walutę.
 
-## ⚠️ Bezpieczeństwo — przeczytaj przed publikacją
-
-Przed wrzuceniem repo na GitHuba **usuń wszystkie klucze i sekrety z kodu** (`main.js`):
-
-- znajdujący się na górze pliku `clientSecret` / `clientId`,
-- zapasowy klucz `CSFLOAT_API_KEY` wpisany na sztywno w kodzie.
-
-Wszystkie sekrety trzymaj wyłącznie w pliku `.env` (jest ignorowany przez Git).
-Jeśli klucz CSFloat został już gdziekolwiek upubliczniony — **wygeneruj nowy** i unieważnij stary.
-
 ## Licencja
 
 Projekt do użytku własnego / edukacyjnego. Dodaj wybraną licencję (np. MIT), jeśli chcesz
